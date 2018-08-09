@@ -1,49 +1,53 @@
 /* This Source Code Form is subject to the terms of the Mozilla Public
- * License, v. 2.0. If a copy of the MPL was not distributed with this file,
- * You can obtain one at http://mozilla.org/MPL/2.0/. */
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
 
 import Foundation
+import Shared
+import SwiftyJSON
 
+open class ClientPayload: CleartextPayloadJSON {
+    override open func isValid() -> Bool {
+        if !super.isValid() {
+            return false
+        }
 
-@objc public class ClientPayload : CleartextPayloadJSON {
-    override public func isValid() -> Bool {
-        // We should also call super.isValid(), but that'll fail:
-        // Global is external, but doesn't have external or weak linkage!
-        // Swift compiler bug #18422804.
-        return !isError &&
-               self["name"].isString &&
-               self["commands"].isArray &&
-               self["type"].isString
+        if self["deleted"].bool ?? false {
+            return true
+        }
+
+        return self["name"].isString() &&
+               self["type"].isString()
     }
 
     var commands: [JSON] {
-        return self["commands"].asArray!
+        return self["commands"].array ?? []   // It might not be present at all.
     }
 
     var name: String {
-        return self["name"].asString!
+        return self["name"].stringValue
     }
 
     var clientType: String {
-        return self["type"].asString!
+        return self["type"].stringValue
     }
-    
-    override public func equalPayloads(obj: CleartextPayloadJSON) -> Bool {
+
+    override open func equalPayloads(_ obj: CleartextPayloadJSON) -> Bool {
         if !(obj is ClientPayload) {
-            return false;
+            return false
         }
 
         if !super.equalPayloads(obj) {
-            return false;
+            return false
         }
 
-        let p = obj as ClientPayload
+        let p = obj as! ClientPayload
         if p.name != self.name {
             return false
         }
-        
+
         if p.clientType != self.clientType {
-            return false;
+            return false
         }
 
         return true

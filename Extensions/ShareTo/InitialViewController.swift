@@ -1,137 +1,173 @@
-// This Source Code Form is subject to the terms of the Mozilla Public
-// License, v. 2.0. If a copy of the MPL was not distributed with this
-// file, You can obtain one at http://mozilla.org/MPL/2.0/
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
 
 import UIKit
+import SnapKit
+import Deferred
+import Shared
+import Storage
 
-let LastUsedShareDestinationsKey = "LastUsedShareDestinations"
+// Reports portrait screen size regardless of the current orientation.
+func screenSizeOrientationIndependent() -> CGSize {
+    let screenSize = UIScreen.main.bounds.size
+    return CGSize(width: min(screenSize.width, screenSize.height), height: max(screenSize.width, screenSize.height))
+}
+
+// Small iPhone screens in landscape require that the popup have a shorter height.
+func isLandscapeSmallScreen(_ traitCollection: UITraitCollection) -> Bool {
+    if !UX.enableResizeRowsForSmallScreens {
+        return false
+    }
+
+    let hasSmallScreen = screenSizeOrientationIndependent().width <= CGFloat(UX.topViewWidth)
+    return hasSmallScreen && traitCollection.verticalSizeClass == .compact
+}
+
+/*
+ The initial view controller is full-screen and is the only one with a valid extension context.
+ It is just a wrapper with a semi-transparent background to darken the screen
+ that embeds the share view controller which is designed to look like a popup.
+
+ The share view controller is embedded using a navigation controller to get a nav bar
+ and standard iOS navigation behaviour.
+ */
+
+class EmbeddedNavController {
+    weak var parent: UIViewController?
+    var controllers = [UIViewController]()
+    var navigationController: UINavigationController
+    var heightConstraint: Constraint!
+    let isSearchMode: Bool
+
+    init(isSearchMode: Bool, parent: UIViewController, rootViewController: UIViewController) {
+        self.parent = parent
+        self.isSearchMode = isSearchMode
+        navigationController = UINavigationController(rootViewController: rootViewController)
+
+        parent.addChildViewController(navigationController)
+        parent.view.addSubview(navigationController.view)
+
+        let width = min(screenSizeOrientationIndependent().width * 0.90, CGFloat(UX.topViewWidth))
+
+        let initialHeight = isSearchMode ? UX.topViewHeightForSearchMode : UX.topViewHeight
+        navigationController.view.snp.makeConstraints { make in
+            make.center.equalToSuperview()
+            make.width.equalTo(width)
+            heightConstraint = make.height.equalTo(initialHeight).constraint
+            layout(forTraitCollection: navigationController.traitCollection)
+        }
+
+        navigationController.view.layer.cornerRadius = UX.dialogCornerRadius
+        navigationController.view.layer.masksToBounds = true
+    }
+
+    func layout(forTraitCollection: UITraitCollection) {
+        if isSearchMode {
+            // Dialog size doesn't change
+            return
+        }
+
+        let updatedHeight: Int
+        if UX.enableResizeRowsForSmallScreens {
+            let shrinkage = UX.navBarLandscapeShrinkage + (UX.numberOfActionRows + 1 /*one info row*/) * UX.perRowShrinkageForLandscape
+            updatedHeight = isLandscapeSmallScreen(forTraitCollection) ? UX.topViewHeight - shrinkage : UX.topViewHeight
+        } else {
+            updatedHeight = forTraitCollection.verticalSizeClass == .compact ? UX.topViewHeight - UX.navBarLandscapeShrinkage :  UX.topViewHeight
+        }
+        heightConstraint.update(offset: updatedHeight)
+    }
+
+    deinit {
+        navigationController.view.removeFromSuperview()
+        navigationController.removeFromParentViewController()
+    }
+}
 
 @objc(InitialViewController)
-class InitialViewController: UIViewController, ShareControllerDelegate
-{
-    var shareDialogController: ShareDialogController!
-    var account: Account?
-    
+class InitialViewController: UIViewController {
+    var embedController: EmbeddedNavController!
+    var shareViewController: ShareViewController!
+
     override func viewDidLoad() {
+        UIDevice.current.beginGeneratingDeviceOrientationNotifications()
         super.viewDidLoad()
-        self.view.backgroundColor = UIColor(white: 0.75, alpha: 0.65) // TODO: Is the correct color documented somewhere?
-        
-        let accountManager = AccountManager(loginCallback: { _ in () }, logoutCallback: { _ in () })
-        self.account = accountManager.getAccount()
-    }
-    
-    override func viewDidAppear(animated: Bool)
-    {
-        super.viewDidAppear(animated)
-        
-        ExtensionUtils.extractSharedItemFromExtensionContext(self.extensionContext, completionHandler: { (item, error) -> Void in
-            if error == nil && item != nil {
-                dispatch_async(dispatch_get_main_queue()) {
-                    self.presentShareDialog(item!)
-                }
-            } else {
-                self.extensionContext!.completeRequestReturningItems([], completionHandler: nil);
-            }
-        })
-    }
-    
-    //
-    
-    func shareControllerDidCancel(shareController: ShareDialogController)
-    {
-        UIView.animateWithDuration(0.25, animations: { () -> Void in
-            self.shareDialogController.view.alpha = 0.0
-        }, completion: { (Bool) -> Void in
-            self.dismissShareDialog()
-            self.extensionContext!.completeRequestReturningItems([], completionHandler: nil);
-        })
-    }
+        view.backgroundColor = UIColor(white: 0.0, alpha: UX.alphaForFullscreenOverlay)
+        view.alpha = 0
 
-    func shareController(shareController: ShareDialogController, didShareItem item: ExtensionUtils.ShareItem, toDestinations destinations: NSSet)
-    {
-        setLastUsedShareDestinations(destinations)
-        
-        UIView.animateWithDuration(0.25, animations: { () -> Void in
-            self.shareDialogController.view.alpha = 0.0
-        }, completion: { (Bool) -> Void in
-            self.dismissShareDialog()
-            
-            if destinations.containsObject(ShareDestinationReadingList) {
-                self.shareToReadingList(item)
-            }
-            
-            if destinations.containsObject(ShareDestinationBookmarks) {
-                self.shareToBookmarks(item)
+        getShareItem().uponQueue(.main) { shareItem in
+            guard let shareItem = shareItem else {
+                self.hidePopupWhenShowingAlert()
+
+                let alert = UIAlertController(title: Strings.SendToErrorTitle, message: Strings.SendToErrorMessage, preferredStyle: .alert)
+                alert.addAction(UIAlertAction(title: Strings.SendToErrorOKButton, style: .default) { _ in self.finish(afterDelay: 0) })
+                self.present(alert, animated: true, completion: nil)
+                return
             }
 
-            self.extensionContext!.completeRequestReturningItems([], completionHandler: nil);
-        })
-    }
-    
-    //
-    
-    func getLastUsedShareDestinations() -> NSSet {
-        if let destinations = NSUserDefaults.standardUserDefaults().objectForKey(LastUsedShareDestinationsKey) as? NSArray {
-            return NSSet(array: destinations)
+            // This is the view controller for the popup dialog
+            self.shareViewController = ShareViewController()
+            self.shareViewController.delegate = self
+            self.shareViewController.shareItem = shareItem
+
+            self.embedController = EmbeddedNavController(isSearchMode: !shareItem.isUrlType(), parent: self, rootViewController: self.shareViewController)
         }
-        return NSSet(object: ShareDestinationBookmarks)
     }
-    
-    func setLastUsedShareDestinations(destinations: NSSet) {
-        NSUserDefaults.standardUserDefaults().setObject(destinations.allObjects, forKey: LastUsedShareDestinationsKey)
-        NSUserDefaults.standardUserDefaults().synchronize()
+
+    override func viewDidAppear(_ animated: Bool) {
+        super.viewDidAppear(animated)
+
+        // The system share dialog dims the screen, then once our share action is selected it closes and the
+        // screen undims and our view controller is shown which again dims the screen. Without a short fade in
+        // the effect appears flash-like.
+        UIView.animate(withDuration: 0.2) {
+            self.view.alpha = 1
+        }
     }
-    
-    func presentShareDialog(item: ExtensionUtils.ShareItem) {
-        shareDialogController = ShareDialogController()
-        shareDialogController.delegate = self
-        shareDialogController.item = item
-        shareDialogController.initialShareDestinations = getLastUsedShareDestinations()
-        
-        self.addChildViewController(shareDialogController)
-        shareDialogController.view.setTranslatesAutoresizingMaskIntoConstraints(false)
-        self.view.addSubview(shareDialogController.view)
-        
-        // Setup constraints for the dialog. We keep the dialog centered with 16 points of padding on both
-        // sides. The dialog grows to max 380 points wide so that it does not look too big on landscape or
-        // iPad devices.
-        
-        let views: NSDictionary = ["dialog": shareDialogController.view]
-        
-        view.addConstraints(NSLayoutConstraint.constraintsWithVisualFormat("H:|-(16@751)-[dialog(<=380@1000)]-(16@751)-|",
-            options: NSLayoutFormatOptions.allZeros, metrics: nil, views: views))
-        
-        let cx = NSLayoutConstraint(item: shareDialogController.view, attribute: NSLayoutAttribute.CenterX,
-            relatedBy: NSLayoutRelation.Equal, toItem: view, attribute: NSLayoutAttribute.CenterX, multiplier: 1.0, constant: 0)
-        cx.priority = 1000 // TODO: Why does UILayoutPriorityRequired give a linker error? SDK Bug?
-        view.addConstraint(cx)
-        
-        view.addConstraint(NSLayoutConstraint(item: shareDialogController.view, attribute: NSLayoutAttribute.CenterY,
-            relatedBy: NSLayoutRelation.Equal, toItem: view, attribute: NSLayoutAttribute.CenterY, multiplier: 1.0, constant: 0))
-        
-        // Fade the dialog in
-        
-        shareDialogController.view.alpha = 0.0
-        UIView.animateWithDuration(0.25, animations: { () -> Void in
-            self.shareDialogController.view.alpha = 1.0
-        }, completion: nil)
+
+    func getShareItem() -> Deferred<ExtensionUtils.ExtractedShareItem?> {
+        let deferred = Deferred<ExtensionUtils.ExtractedShareItem?>()
+        ExtensionUtils.extractSharedItem(fromExtensionContext: extensionContext) { item, error in
+            if let item = item, error == nil {
+                deferred.fill(item)
+            } else {
+                deferred.fill(nil)
+                self.extensionContext?.cancelRequest(withError: CocoaError(.keyValueValidation))
+            }
+        }
+        return deferred
     }
-    
-    func dismissShareDialog() {
-        shareDialogController.willMoveToParentViewController(nil)
-        shareDialogController.view.removeFromSuperview()
-        shareDialogController.removeFromParentViewController()
-    }
-    
-    //
-    
-    func shareToReadingList(item: ExtensionUtils.ShareItem) {
-        // TODO: Discuss how to share to the (local) reading list
-    }
-    
-    func shareToBookmarks(item: ExtensionUtils.ShareItem) {
-        if account != nil { // TODO: We need to properly deal with this.
-            account?.bookmarks.shareItem(item)
+
+    override func willTransition(to newCollection: UITraitCollection, with coordinator: UIViewControllerTransitionCoordinator) {
+        coordinator.animate(alongsideTransition: { _ in
+            self.embedController.layout(forTraitCollection: newCollection)
+            self.shareViewController.layout(forTraitCollection: newCollection)
+        }) { _ in
+            // There is a layout change propagation bug for this view setup (i.e. container view controller that is a UINavigationViewController).
+            // This is the only way to force UINavigationBar to perform a layout. Without this, the layout is for the previous size class.
+            self.embedController.navigationController.isNavigationBarHidden = true
+            self.embedController.navigationController.isNavigationBarHidden = false
         }
     }
 }
+
+extension InitialViewController: ShareControllerDelegate {
+    func finish(afterDelay: TimeInterval) {
+        UIView.animate(withDuration: 0.2, delay: afterDelay, options: [], animations: {
+            self.view.alpha = 0
+        }, completion: { _ in
+            self.extensionContext?.completeRequest(returningItems: [], completionHandler: nil)
+        })
+    }
+
+    func getValidExtensionContext() -> NSExtensionContext? {
+        return extensionContext
+    }
+
+    // At startup, the extension may show an alert that it can't share. In this case for a better UI, rather than showing
+    // 2 popup dialogs (the main one and then the alert), just show the alert.
+    func hidePopupWhenShowingAlert() {
+        embedController.navigationController.view.alpha = 0
+    }
+}
+
